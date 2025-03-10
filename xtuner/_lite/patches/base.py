@@ -2,6 +2,7 @@
 import json
 import os
 from abc import ABC, abstractmethod
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Literal, Optional, Tuple, Union, cast
 
@@ -194,17 +195,23 @@ class HFCheckpointLoader:
         elif "model.bin.index.json" in os.listdir(self.model_path):
             index_json = os.path.join(self.model_path, "model.bin.index.json")
             self.use_safetensors = False
+        elif "model.safetensors" in os.listdir(self.model_path):
+            self.use_safetensors = True
+            index_json = None
         else:
             raise FileNotFoundError
 
-        with open(index_json) as f:
-            self.weight_map = json.load(f)["weight_map"]
+        if index_json is not None:
+            with open(index_json) as f:
+                self.weight_map = json.load(f)["weight_map"]
+        else:
+            self.weight_map = defaultdict(lambda: "model.safetensors")
 
         self.current_file = None
         self.buffer = None
 
     def load(self, key):
-        if key not in self.weight_map:
+        if key not in self.weight_map and not isinstance(self.weight_map, defaultdict):
             logger.warning(f"{key} not in checkpoint.")
             return
 
