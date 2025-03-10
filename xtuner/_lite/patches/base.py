@@ -388,7 +388,12 @@ class PatchedCausalLM(ABC, nn.Module):
         pass
 
     @abstractmethod
-    def fully_shard(self, parallel_config: FSDPConfig):
+    def fully_shard(
+        self,
+        fsdp_config: FSDPConfig,
+        module2name: Optional[Dict[nn.Module, str]] = None,
+        checkpoint_loader: Optional[HFCheckpointLoader] = None,
+    ):
         pass
 
     @abstractmethod
