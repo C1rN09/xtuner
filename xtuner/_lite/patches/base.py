@@ -244,7 +244,7 @@ class HFCheckpointLoader:
         return weight
 
 
-@torch.no_grad
+@torch.no_grad()
 def lazy_init_fn(module, module2name, checkpoint_loader):
     device = DEVICE_MODULE.current_device()
 
@@ -306,7 +306,7 @@ class FSDPConfig:
     cpu_offload: bool = True
     param_dtype: torch.dtype = torch.bfloat16
     reduce_dtype: torch.dtype = torch.bfloat16
-    torch_compile: torch.dtype = False
+    torch_compile: bool = False
     max_length: Optional[int] = None
     mesh_prefix: str = "default"
 
@@ -348,17 +348,17 @@ class PatchedCausalLM(ABC, nn.Module):
 
     @property
     @abstractmethod
-    def data_parallel_mesh(self):
+    def data_parallel_mesh(self) -> DeviceMesh:
         pass
 
     @property
     @abstractmethod
-    def data_mesh(self):
+    def data_mesh(self) -> DeviceMesh:
         pass
 
     @property
     @abstractmethod
-    def sequence_parallel_mesh(self):
+    def sequence_parallel_mesh(self) -> DeviceMesh:
         pass
 
     @abstractmethod
