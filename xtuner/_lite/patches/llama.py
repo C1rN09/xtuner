@@ -250,10 +250,9 @@ class CUDAPatchedLlamaForCausalLM(PatchedCausalLM, GenerateMixin):
 
         self._patched_model = self.dispatch_hf_code(model)
 
-        self.init_model_config(fsdp_config)
-
-        self._fsdp_config = fsdp_config
-        if self._fsdp_config is not None:
+        if fsdp_config is not None:
+            self._fsdp_config = fsdp_config
+            self.init_model_config(fsdp_config)
             self.fully_shard(fsdp_config)
 
     @property
