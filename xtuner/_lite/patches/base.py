@@ -418,6 +418,7 @@ class PatchedCausalLM(ABC, nn.Module):
         save_peft_format: bool = True,
         **kwargs,
     ):
+        old_embed_size = self.rank0_model.get_input_embeddings().weight.shape[0]
         if dist.is_initialized() and dist.is_available():
             rank = dist.get_rank()
         else:
@@ -439,6 +440,20 @@ class PatchedCausalLM(ABC, nn.Module):
 
             if rank == 0:
                 set_module_tensor_to_device(self.rank0_model, name, "cpu", full_param)
+
+        new_embed_size = self.rank0_model.get_input_embeddings().weight.shape[0]
+        if old_embed_size != new_embed_size:
+            # Embedding has been resized, should resize back before save
+            self.rank0_model.resize_token_embeddings(new_num_tokens=old_embed_size)
+            logger.info(
+                f"Resized embedding from {new_embed_size} to {old_embed_size} "
+                "before saving checkpoint"
+            )
+        else:
+            logger.info(
+                f"Embedding size is consistent with the original model: {old_embed_size}. "
+                "No need to resize embedding before saving checkpoint"
+            )
 
         if rank == 0:
             self.rank0_model.save_pretrained(
