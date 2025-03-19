@@ -418,7 +418,6 @@ class PatchedCausalLM(ABC, nn.Module):
         save_peft_format: bool = True,
         **kwargs,
     ):
-        old_embed_size = self.rank0_model.get_input_embeddings().weight.shape[0]
         if dist.is_initialized() and dist.is_available():
             rank = dist.get_rank()
         else:
@@ -428,6 +427,17 @@ class PatchedCausalLM(ABC, nn.Module):
             self.rank0_model.to(torch.bfloat16)
 
         from torch.distributed._tensor import DTensor
+
+        input_embedding_name = None
+        lm_head_name = None
+        for name, module in self.patched_model.named_modules():
+            if module is self.patched_model.get_input_embeddings():
+                input_embedding_name = name
+            if (
+                module is self.patched_model.get_output_embeddings()
+                and not self.patched_model.config.tie_word_embeddings
+            ):
+                lm_head_name = name
 
         dtype = self.patched_model.config.torch_dtype
         for name, param in self.patched_model.state_dict().items():
@@ -439,21 +449,15 @@ class PatchedCausalLM(ABC, nn.Module):
                 full_param = param.to(dtype).cpu()
 
             if rank == 0:
-                set_module_tensor_to_device(self.rank0_model, name, "cpu", full_param)
+                old_embed_size = self.rank0_model.get_input_embeddings().weight.shape[0]
+                if input_embedding_name is not None and input_embedding_name in name:
+                    if full_param.shape[0] != old_embed_size:
+                        full_param = full_param[:old_embed_size, ...]
+                if lm_head_name is not None and lm_head_name in name:
+                    if full_param.shape[0] != old_embed_size:
+                        full_param = full_param[:old_embed_size, ...]
 
-        new_embed_size = self.rank0_model.get_input_embeddings().weight.shape[0]
-        if old_embed_size != new_embed_size:
-            # Embedding has been resized, should resize back before save
-            self.rank0_model.resize_token_embeddings(new_num_tokens=old_embed_size)
-            logger.info(
-                f"Resized embedding from {new_embed_size} to {old_embed_size} "
-                "before saving checkpoint"
-            )
-        else:
-            logger.info(
-                f"Embedding size is consistent with the original model: {old_embed_size}. "
-                "No need to resize embedding before saving checkpoint"
-            )
+                set_module_tensor_to_device(self.rank0_model, name, "cpu", full_param)
 
         if rank == 0:
             self.rank0_model.save_pretrained(
@@ -469,6 +473,7 @@ class PatchedCausalLM(ABC, nn.Module):
                 save_peft_format,
                 **kwargs,
             )
+        dist.barrier()
 
     # def save_checkpoint(self,
     #                     optimizer: Optional[torch.optim.Optimizer] = None):
