@@ -2,7 +2,7 @@ import copy
 import os
 import types
 from functools import partial
-from typing import Any, Dict, List, Optional, Tuple, Union, cast
+from typing import Any, Dict, List, Optional, Tuple, Union, cast, Callable
 
 import torch
 import torch.distributed as dist
@@ -14,7 +14,7 @@ from torch.distributed._composable.fsdp import (
     MixedPrecisionPolicy,
     fully_shard,
 )
-from torch.distributed._tensor import DTensor, Replicate, Shard, distribute_tensor, Partial
+from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor, Partial, Placement, distribute_module
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper,
 )
@@ -26,12 +26,14 @@ from torch.distributed.tensor.parallel import (
     RowwiseParallel,
     SequenceParallel,
     parallelize_module,
+    ParallelStyle,
 )
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from xtuner._lite.accelerate import liger_kernel_is_available
 from xtuner._lite.chat import HybridChatTemplate
 from xtuner._lite.modelings.internvl_chat import InternVLChatConfig, InternVLChatModel
+from xtuner._lite.modelings.internvl_chat.modeling_intern_vit import InternAttention, InternVisionEncoder
 from xtuner._lite.parallel.sequence import split_for_sequence_parallel
 from xtuner._lite.patches.base import (
     FSDPConfig,
@@ -45,84 +47,199 @@ from xtuner._lite.patches.mixins import GenerateMixin
 from xtuner._lite.patches.utils import pad_to_max_length, pad_to_multiple_of
 
 
+class ColwiseParallelQKV3HDV2(ColwiseParallel):
+    def _apply(self, module: nn.Module, device_mesh: DeviceMesh):
+        if not isinstance(module, nn.Linear):
+            raise ValueError(f"module must be nn.Linear, got {type(module)}")
+        output_size, input_size = module.weight.shape
+        assert output_size == input_size * 3
+        # NOTE: In order to apply ColwiseParallel, we have to permute qkv linear from
+        # (3, h, d) -> (h, d, 3) during parallelize_module, and we hacked attention
+        # forward function in modeling_intern_vit.py to make it correct.
+        module.weight.data = (
+            module.weight.data.view(3, input_size, input_size)
+            .transpose(0, 1)
+            .reshape(output_size, input_size)
+            .contiguous()
+        )
+        if module.bias is not None:
+            module.bias.data = (
+                module.bias.data.view(3, input_size)
+                .transpose(0, 1)
+                .reshape(-1)
+                .contiguous()
+            )
+        return super()._apply(module, device_mesh)
+
+
+# class ColwiseParallelQKV3HD(ColwiseParallel):
+#     def _partition_linear_fn(self, name, module, device_mesh):
+#         for name, param in module.named_parameters():
+#             output_size = param.shape[0]
+#             assert output_size % 3 == 0
+#             dist_param_tf = DTensor.from_local(
+#                 param.view(3, -1, param.shape[-1]),
+#                 device_mesh,
+#                 placements=(Replicate(),),
+#             )
+#             dist_param_ts = dist_param_tf.redistribute(device_mesh, placements=(Shard(1),))
+#             dist_param = dist_param_ts.view(-1, param.shape[-1])
+#             # q, k, v = param.chunk(3, dim=0)
+#             # q_, k_, v_ = (
+#             #     DTensor.from_local(p, device_mesh, (Replicate(),)).redistribute(
+#             #         device_mesh, (Shard(0),)
+#             #     )
+#             #     for p in (q, k, v)
+#             # )
+#             # m_ = torch.cat([q_, k_, v_], dim=0)
+#             # dist_param = nn.Parameter(m_)
+#             dist.breakpoint()
+#             module.register_parameter(name, dist_param)
+#
+#     def _apply(self, module: nn.Module, device_mesh: DeviceMesh):
+#         if not isinstance(module, nn.Linear):
+#             raise ValueError(f"module must be nn.Linear, got {type(module)}")
+#         return super()._apply(module, device_mesh)
+#
+#
+# class InternVisionEmbeddingChannelwiseParallel(ParallelStyle):
+#     def __init__(
+#         self,
+#         *,
+#         input_layouts: Optional[Placement] = None,
+#         output_layouts: Optional[Placement] = None,
+#         use_local_output: bool = True,
+#     ):
+#         super().__init__()
+#         self.input_layouts = (input_layouts or Replicate(),)
+#         self.output_layouts = (output_layouts or Shard(-1),)
+#         self.desired_input_layouts = (Replicate(),)
+#         self.use_local_output = use_local_output
+#
+#     @staticmethod
+#     def _prepare_input_fn(
+#         input_layouts: Tuple[Placement, ...],
+#         desired_input_layouts: Tuple[Placement, ...],
+#         mod: nn.Module,
+#         inputs,
+#         device_mesh: DeviceMesh,
+#     ):
+#         input_tensor = inputs[0]
+#         if not isinstance(input_tensor, DTensor):
+#             input_tensor = DTensor.from_local(
+#                 input_tensor, device_mesh, input_layouts, run_check=False
+#             )
+#
+#         if input_layouts != desired_input_layouts:
+#             input_tensor = input_tensor.redistribute(
+#                 placements=desired_input_layouts, async_op=True
+#             )
+#         return input_tensor
+#
+#     @staticmethod
+#     def _prepare_output_fn(
+#         output_layouts: Tuple[Placement, ...],
+#         use_local_output: bool,
+#         mod: nn.Module,
+#         outputs,
+#         device_mesh: DeviceMesh,
+#     ):
+#         dist.breakpoint()
+#         if outputs.placements != output_layouts:
+#             outputs = outputs.redistribute(placements=output_layouts, async_op=True)
+#         return outputs.to_local() if use_local_output else outputs
+#
+#     def _partition_fn(self, name, module, device_mesh):
+#         if isinstance(module, nn.Conv2d):
+#             return
+#
+#         module.register_parameter(
+#             "class_embedding",
+#             nn.Parameter(
+#                 distribute_tensor(module.class_embedding, device_mesh, [Shard(-1)])
+#             ),
+#         )
+#         module.register_parameter(
+#             "position_embedding",
+#             nn.Parameter(
+#                 distribute_tensor(module.position_embedding, device_mesh, [Shard(-1)])
+#             ),
+#         )
+#         conv = module.patch_embedding
+#         for name, param in conv.named_parameters():
+#             dist_param = nn.Parameter(distribute_tensor(param, device_mesh, [Shard(0)]))
+#             conv.register_parameter(name, dist_param)
+#
+#     def _apply(self, module: nn.Module, device_mesh: DeviceMesh):
+#         return distribute_module(
+#             module,
+#             device_mesh,
+#             self._partition_fn,
+#             partial(
+#                 self._prepare_input_fn, self.input_layouts, self.desired_input_layouts
+#             ),
+#             partial(
+#                 self._prepare_output_fn, self.output_layouts, self.use_local_output
+#             ),
+#         )
+
+
 class CUDAPatchedInternVLChatModel(PatchedCausalLM):
     device_type = "cuda"
 
-    # TODO: vision_model tensor parallel
     layer_tp_plan = {
-        "norm1": PrepareModuleInput(
-            input_layouts=(Replicate(),),
+        "norm1": SequenceParallel(),
+        "attn": PrepareModuleInput(
+            input_layouts=(Shard(1),),
             desired_input_layouts=(Replicate(),),
         ),
-        # "attn": PrepareModuleInput(
-        #     input_layouts=(Shard(1),),
+        "attn.qkv": ColwiseParallelQKV3HDV2(),
+        # "attn.inner_attn": PrepareModuleInput(
+        #     input_layouts=(Replicate(),),
         #     desired_input_layouts=(Replicate(),),
+        #     use_local_output=True,
         # ),
-        # "attn.qkv": ColwiseParallel(),
-        "attn.inner_attn": PrepareModuleInput(
-            input_layouts=(Replicate(),),
-            desired_input_layouts=(Replicate(),),
-            use_local_output=True,
-        ),
-        "attn.proj": PrepareModuleInput(
-            input_layouts=(Replicate(),),
-            desired_input_layouts=(Replicate(),),
-        ),
+        "attn.proj": RowwiseParallel(),
         # "attn.proj_drop": SequenceParallel(),
         "drop_path1": PrepareModuleOutput(
             output_layouts=(Replicate(),),
-            desired_output_layouts=(Replicate(),),
+            desired_output_layouts=(Shard(1),),
         ),
-        "norm2": PrepareModuleInput(
-            input_layouts=(Replicate(),),
+        "norm2": SequenceParallel(),
+        "mlp": PrepareModuleInput(
+            input_layouts=(Shard(1),),
             desired_input_layouts=(Replicate(),),
         ),
-        # "mlp": PrepareModuleInput(
-        #     input_layouts=(Shard(1),),
-        #     desired_input_layouts=(Replicate(),),
-        # ),
-        # "mlp.fc1": ColwiseParallel(),
-        # "mlp.fc2": RowwiseParallel(output_layouts=Shard(1)),
+        "mlp.fc1": ColwiseParallel(),
+        "mlp.fc2": RowwiseParallel(),
         "drop_path2": PrepareModuleOutput(
             output_layouts=(Replicate(),),
-            desired_output_layouts=(Replicate(),),
+            desired_output_layouts=(Shard(1),),
         ),
     }
 
-    # TODO: vision_model tensor parallel
     casual_tp_plan = {
-        "vision_model.embeddings": PrepareModuleInput(
-            input_layouts=(Replicate(),),
-            desired_input_layouts=(Replicate(),),
-        ),
-        # "vision_model.embeddings.patch_embeddings": None, # This is conv2d
-        "vision_model.encoder": PrepareModuleInput(
-            input_kwarg_layouts={"inputs_embeds": Shard(-1)},
-            desired_input_kwarg_layouts={"inputs_embeds": Replicate()},
+        # "vision_model.embeddings": InternVisionEmbeddingChannelwiseParallel(
+        #     input_layouts=Replicate(),
+        #     output_layouts=Shard(1),
+        #     use_local_output=False,
+        # ),
+        "vision_model": PrepareModuleOutput(
+            output_layouts=(Shard(1),),
+            desired_output_layouts=(Replicate(),),
             use_local_output=True,
         ),
-        # "vision_model.encoder": PrepareModuleInput(
-        #     input_kwarg_layouts={"inputs_embeds": Replicate()},
-        #     desired_input_kwarg_layouts={"inputs_embeds": Shard(1)},
-        #     use_local_output=True,
-        # ),
-        # "vision_model": PrepareModuleOutput(
-        #     output_layouts=(Shard(1),),
-        #     desired_output_layouts=(Replicate(),),
-        # ),
-        # "mlp1": PrepareModuleInput(
-        #     input_layouts=(Replicate(),),
-        #     desired_input_layouts=(Replicate(),),
-        # ),
-        "mlp1.0": PrepareModuleInput(
+        "vision_model.encoder": PrepareModuleInput(
+            input_kwarg_layouts={"inputs_embeds": Replicate()},
+            desired_input_kwarg_layouts={"inputs_embeds": Shard(1)},
+        ),
+        "mlp1": PrepareModuleInput(
             input_layouts=(Replicate(),),
-            desired_input_layouts=(Replicate(),),
-        ),  # LayerNorm
-        # "mlp1.1": ColwiseParallel(),  # Linear
-        "mlp1.3": PrepareModuleOutput(
-            output_layouts=(Replicate(),),
-            desired_output_layouts=(Replicate(),),
-        ),  # Linear
+            desired_input_layouts=(Shard(1),),
+        ),
+        "mlp1.0": SequenceParallel(),  # LayerNorm
+        "mlp1.1": ColwiseParallel(input_layouts=Shard(1)),  # Linear
+        "mlp1.3": RowwiseParallel(),  # Linear
     }
 
     def __init__(self, model: InternVLChatModel, fsdp_config: Optional[FSDPConfig]):
@@ -195,15 +312,14 @@ class CUDAPatchedInternVLChatModel(PatchedCausalLM):
         self._patched_lm.init_model_config(fsdp_config)
 
         vision_config = self.patched_model.config.vision_config
-        # TODO: vision_model tensor parallel
-        # assert vision_config.num_attention_heads >= fsdp_config.tp_size
-        # assert vision_config.num_attention_heads % fsdp_config.tp_size == 0
+        assert vision_config.num_attention_heads >= fsdp_config.tp_size
+        assert vision_config.num_attention_heads % fsdp_config.tp_size == 0
 
         self._model_config = ModelConfig(
             num_hidden_layers=vision_config.num_hidden_layers,
             num_attention_heads=vision_config.num_attention_heads,
-            # num_key_value_heads=vision_config.num_attention_heads // fsdp_config.tp_size,
-            num_key_value_heads=vision_config.num_attention_heads,
+            num_key_value_heads=vision_config.num_attention_heads // fsdp_config.tp_size,
+            # num_key_value_heads=vision_config.num_attention_heads,
             hidden_size=vision_config.hidden_size,
             intermediate_size=vision_config.intermediate_size,
             vocab_size=-1,
@@ -229,6 +345,13 @@ class CUDAPatchedInternVLChatModel(PatchedCausalLM):
     @classmethod
     def dispatch_hf_code(cls, model: InternVLChatModel) -> InternVLChatModel:
         model.forward = types.MethodType(cls.patched_causal_forward, model)
+        for module in model.modules():
+            if isinstance(module, InternAttention):
+                module.forward = types.MethodType(
+                    cls.patched_encoder_attn_forward, module
+                )
+            elif isinstance(module, InternVisionEncoder):
+                module.forward = types.MethodType(cls.patched_encoder_forward, module)
         return model
 
     def fully_shard(
@@ -275,15 +398,11 @@ class CUDAPatchedInternVLChatModel(PatchedCausalLM):
             layer.apply(param_init_fn)
 
             if self.tp_mesh.size() > 1:
-                # TODO: vision_model tensor parallel
-                pass
-                # NOTE: This is a workaround before tp works: Replicate all parameters
-                # _replicate_other_params(layer, self.tp_mesh)
-                # parallelize_module(
-                #     module=layer,
-                #     device_mesh=self.tp_mesh,
-                #     parallelize_plan=self.layer_tp_plan,
-                # )
+                parallelize_module(
+                    module=layer,
+                    device_mesh=self.tp_mesh,
+                    parallelize_plan=self.layer_tp_plan,
+                )
 
             # NOTE: InternVLChatModel hardcode enable gradient checkpointing for
             # all layers, so we don't need to do it here
@@ -300,9 +419,7 @@ class CUDAPatchedInternVLChatModel(PatchedCausalLM):
 
             fully_shard(
                 layer,
-                # mesh=self.fsdp_mesh,
-                # TODO: vision_model tensor parallel. Pure FSDP currently
-                mesh=self.world_mesh,
+                mesh=self.fsdp_mesh,
                 mp_policy=mp_policy,
                 reshard_after_forward=fsdp_config.reshard_after_forward,
                 offload_policy=CPUOffloadPolicy()
@@ -320,47 +437,89 @@ class CUDAPatchedInternVLChatModel(PatchedCausalLM):
         self.patched_model.mlp1.apply(param_init_fn)
 
         if self.tp_mesh.size() > 1:
-            # TODO: vision_model tensor parallel
-            pass
-            # # Channel-wise parallel for convolution/embedding
-            # param = vision_model.embeddings.patch_embedding.weight
-            # vision_model.embeddings.patch_embedding.register_parameter(
-            #     "weight",
-            #     nn.Parameter(distribute_tensor(param, self.tp_mesh, [Shard(0)])),
-            # )  # (C_out, C_in, kernel_h, kernel_w)
-            # param = vision_model.embeddings.patch_embedding.bias
-            # vision_model.embeddings.patch_embedding.register_parameter(
-            #     "bias",
-            #     nn.Parameter(distribute_tensor(param, self.tp_mesh, [Shard(0)])),
-            # )  # (C_out)
-            # param = vision_model.embeddings.class_embedding
-            # vision_model.embeddings.register_parameter(
-            #     "class_embedding",
-            #     nn.Parameter(distribute_tensor(param, self.tp_mesh, [Shard(-1)])),
-            # )
-            # param = vision_model.embeddings.position_embedding
-            # vision_model.embeddings.register_parameter(
-            #     "position_embedding",
-            #     nn.Parameter(distribute_tensor(param, self.tp_mesh, [Shard(-1)])),
-            # )
-            # # Tensor-parallel for other parts
-            # _replicate_other_params(self.patched_model.mlp1, self.tp_mesh)
-            # parallelize_module(
-            #     module=self.patched_model,
-            #     device_mesh=self.tp_mesh,
-            #     parallelize_plan=self.casual_tp_plan,
-            # )
+            parallelize_module(
+                module=self.patched_model,
+                device_mesh=self.tp_mesh,
+                parallelize_plan=self.casual_tp_plan,
+            )
 
         fully_shard(
-            self.patched_model,
-            # mesh=self.fsdp_mesh,
-            # TODO: vision_model tensor parallel. Pure FSDP currently
+            self.patched_model.vision_model.embeddings,
             mesh=self.world_mesh,
             mp_policy=mp_policy,
             reshard_after_forward=fsdp_config.reshard_after_forward,
             offload_policy=CPUOffloadPolicy() if fsdp_config.cpu_offload else None,
         )
+        fully_shard(
+            self.patched_model,
+            mesh=self.fsdp_mesh,
+            mp_policy=mp_policy,
+            reshard_after_forward=fsdp_config.reshard_after_forward,
+            offload_policy=CPUOffloadPolicy() if fsdp_config.cpu_offload else None,
+        )
 
+    @staticmethod
+    def patched_encoder_forward(
+        module: InternVisionEncoder,
+        inputs_embeds,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ):
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else module.config.output_hidden_states
+        )
+        return_dict = return_dict if return_dict is not None else module.config.use_return_dict
+
+        encoder_states = () if output_hidden_states else None
+        hidden_states = inputs_embeds
+
+        for idx, encoder_layer in enumerate(module.layers):
+            if output_hidden_states:
+                encoder_states = encoder_states + (hidden_states,)
+            if module.gradient_checkpointing and module.training:
+                layer_outputs = torch.utils.checkpoint.checkpoint(
+                    encoder_layer,
+                    hidden_states)
+            else:
+                layer_outputs = encoder_layer(
+                    hidden_states,
+                )
+            hidden_states = layer_outputs
+
+        if output_hidden_states:
+            encoder_states = encoder_states + (hidden_states,)
+
+        if not return_dict:
+            return tuple(v for v in [hidden_states, encoder_states] if v is not None)
+        return BaseModelOutput(
+            last_hidden_state=hidden_states, hidden_states=encoder_states
+        )
+
+    @staticmethod
+    def patched_encoder_attn_forward(
+        module: InternAttention,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.IntTensor,
+        max_s: int,
+    ) -> torch.Tensor:
+        from einops import rearrange
+        assert module.use_flash_attn, "xtuner training only supports flash attention for now"
+        qkv = module.qkv(hidden_states)
+        # NOTE: In order to apply ColwiseParallel, we have to do hack here to transpose
+        # qkv linear. Corresponding operations should be done both at param initialization
+        # and checkpoint saving
+        qkv = rearrange(qkv, 'b s (h d three) -> b s three h d', three=3, d=module.head_dim)
+
+        if module.qk_normalization:
+            q, k, v = qkv.unbind(2)
+            q = module.q_norm(q.flatten(-2, -1)).view(q.shape)
+            k = module.k_norm(k.flatten(-2, -1)).view(k.shape)
+            qkv = torch.stack([q, k, v], dim=2)
+
+        context, _ = module.inner_attn(qkv, cu_seqlens=cu_seqlens, max_s=max_s)
+        outs = module.proj(rearrange(context, 'b s h d -> b s (h d)'))
+        outs = module.proj_drop(outs)
+        return outs
 
     @staticmethod
     def patched_causal_forward(
@@ -615,3 +774,93 @@ class CUDAPatchedInternVLChatModel(PatchedCausalLM):
             outputs.loss = outputs.loss / global_valid_tokens
 
         return outputs
+
+    def save_pretrained(
+        self,
+        save_directory: Union[str, os.PathLike],
+        is_main_process: bool = True,
+        state_dict: Optional[dict] = None,
+        save_function: Callable = torch.save,
+        push_to_hub: bool = False,
+        max_shard_size: Union[int, str] = "5GB",
+        safe_serialization: bool = True,
+        variant: Optional[str] = None,
+        token: Optional[Union[str, bool]] = None,
+        save_peft_format: bool = True,
+        **kwargs,
+    ):
+        if dist.is_initialized() and dist.is_available():
+            rank = dist.get_rank()
+        else:
+            rank = 0
+
+        from torch.distributed._tensor import DTensor
+
+        input_embedding_name = None
+        lm_head_name = None
+        for name, module in self.patched_model.named_modules():
+            if module is self.patched_model.get_input_embeddings():
+                input_embedding_name = name
+            if (
+                module is self.patched_model.get_output_embeddings()
+                and not self.patched_model.config.tie_word_embeddings
+            ):
+                lm_head_name = name
+
+        dtype = self.patched_model.config.torch_dtype
+        for name, param in self.patched_model.state_dict().items():
+            if self.fsdp_config.torch_compile and "_orig_mod." in name:
+                name = name.replace("_orig_mod.", "")
+            if isinstance(param, DTensor):
+                full_param = param.to(dtype).full_tensor().cpu()
+            else:
+                full_param = param.to(dtype).cpu()
+
+            if rank == 0:
+                old_embed_size = self.rank0_model.get_input_embeddings().weight.shape[0]
+                if input_embedding_name is not None and input_embedding_name in name:
+                    if full_param.shape[0] != old_embed_size:
+                        full_param = full_param[:old_embed_size, ...]
+                if lm_head_name is not None and lm_head_name in name:
+                    if full_param.shape[0] != old_embed_size:
+                        full_param = full_param[:old_embed_size, ...]
+                if "qkv.weight" in name:
+                    # NOTE: In order to apply ColwiseParallel, we permuted qkv linear from
+                    # (3, h, d) -> (h, d, 3) during parallelize_module(ColwiseParallelQKV3HD),
+                    # and we hacked attention forward function in modeling_intern_vit.py.
+                    # Here, we must retain the original order before saving checkpoint
+                    print(f"Permuting qkv param: {name}")
+                    output_size, input_size = full_param.shape
+                    assert output_size == input_size * 3
+                    full_param = (
+                        full_param.view(input_size, 3, input_size)
+                        .transpose(0, 1)
+                        .reshape(output_size, input_size)
+                    )
+                elif "qkv.bias" in name:
+                    print(f"Permugting qkv param: {name}")
+                    output_size = full_param.shape[0]
+                    assert full_param.ndim == 1
+                    full_param = (
+                        full_param.view(output_size // 3, 3)
+                        .transpose(0, 1)
+                        .reshape(output_size)
+                    )
+
+                set_module_tensor_to_device(self.rank0_model, name, "cpu", full_param)
+
+        if rank == 0:
+            self.rank0_model.save_pretrained(
+                save_directory,
+                is_main_process,
+                state_dict,
+                save_function,
+                push_to_hub,
+                max_shard_size,
+                safe_serialization,
+                variant,
+                token,
+                save_peft_format,
+                **kwargs,
+            )
+        dist.barrier()
