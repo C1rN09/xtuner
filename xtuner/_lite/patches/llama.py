@@ -378,10 +378,14 @@ class CUDAPatchedLlamaForCausalLM(PatchedCausalLM, GenerateMixin):
 
         if not getattr(self.patched_model.config, "skip_checkpoint", False):
             if module2name is None:
-                module2name = {mod: name for name, mod in self.patched_model.named_modules()}
+                module2name = {
+                    mod: name for name, mod in self.patched_model.named_modules()
+                }
 
             if checkpoint_loader is None:
-                checkpoint_loader = HFCheckpointLoader(self.patched_model.config._name_or_path)
+                checkpoint_loader = HFCheckpointLoader(
+                    self.patched_model.config._name_or_path
+                )
             param_init_fn = partial(
                 lazy_init_fn,
                 module2name=module2name,
@@ -464,9 +468,7 @@ class CUDAPatchedLlamaForCausalLM(PatchedCausalLM, GenerateMixin):
 
         # Pad embedding and lm_head to ensure they are divisible by tp_size * fsdp_size
         # NOTE: We assume world_size = tp_size * fsdp_size here
-        self.patched_model.resize_token_embeddings(
-            pad_to_multiple_of=world_size
-        )
+        self.patched_model.resize_token_embeddings(pad_to_multiple_of=world_size)
 
         if tp_mesh.size() > 1:
             _weight = self.patched_model.lm_head.weight
