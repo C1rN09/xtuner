@@ -483,13 +483,13 @@ class CUDAPatchedLlamaForCausalLM(PatchedCausalLM, GenerateMixin):
                 self.casual_tp_plan,
             )
 
-        fully_shard(
-            self.patched_model.model.embed_tokens,
-            mesh=fsdp_mesh,
-            mp_policy=mp_policy,
-            reshard_after_forward=fsdp_config.reshard_after_forward,
-            offload_policy=CPUOffloadPolicy() if fsdp_config.cpu_offload else None,
-        )
+        # fully_shard(
+        #     self.patched_model.model.embed_tokens,
+        #     mesh=fsdp_mesh,
+        #     mp_policy=mp_policy,
+        #     reshard_after_forward=fsdp_config.reshard_after_forward,
+        #     offload_policy=CPUOffloadPolicy() if fsdp_config.cpu_offload else None,
+        # )
         fully_shard(
             self.patched_model,
             mesh=fsdp_mesh,
